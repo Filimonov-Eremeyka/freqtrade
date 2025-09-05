@@ -1,0 +1,13 @@
+# C:\Users\karpe\Documents\Projects\freqtrade\docker-compose.yml
+services:
+  freqtrade:
+    build: .
+    restart: unless-stopped
+    container_name: freqtrade
+    volumes:
+      # Нам нужна только эта одна строка. Она дает доступ ко всему, что внутри user_data.
+      - "./user_data:/freqtrade/user_data"
+    ports:
+      - "127.0.0.1:8080:8080"
+    command: >
+      trade --config /freqtrade/user_data/config.json

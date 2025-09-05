@@ -1,0 +1,136 @@
+import numpy as np
+import pandas as pd
+from pandas import DataFrame
+from freqtrade.strategy import IStrategy
+import logging
+
+from skd_indicator import SkdIndicator
+
+class SkdVisualization(IStrategy):
+    """
+    Визуализация уровней по СКД:
+    - сигнальная свеча = t+2 после СКД;
+    - уровни рисуются «отрезками», живущими N свечей;
+    - чтобы линии не склеивались, используем слоты и избегаем
+      повторного использования того же слота для соседних отрезков.
+    """
+    INTERFACE_VERSION = 3
+    logger = logging.getLogger(__name__)
+
+    timeframe = '5m'
+    startup_candle_count = 50
+
+    minimal_roi = {"0": 100}
+    stoploss = -1.0
+    process_only_new_candles = True
+
+    # Параметры уровней
+    signal_line_len: int = 20     # TTL отрезка
+    max_slots: int = 4            # слотов на тип (buy/sell)
+    vol_min: float | None = None  # фильтр по объёму для СКД (например 50)
+
+    plot_config = {
+        'main_plot': {
+            # маркеры старта уровней
+            'skd_buy_marker':  {'type': 'scatter',
+                                'plotly': {'mode': 'markers', 'marker': {'symbol': 'triangle-up', 'size': 9}}},
+            'skd_sell_marker': {'type': 'scatter',
+                                'plotly': {'mode': 'markers', 'marker': {'symbol': 'triangle-down', 'size': 9}}},
+
+            # слоты BUY
+            'skd_buy_signal_line_0':  {'type': 'scatter', 'plotly': {'mode': 'lines'}},
+            'skd_buy_signal_line_1':  {'type': 'scatter', 'plotly': {'mode': 'lines'}},
+            'skd_buy_signal_line_2':  {'type': 'scatter', 'plotly': {'mode': 'lines'}},
+            'skd_buy_signal_line_3':  {'type': 'scatter', 'plotly': {'mode': 'lines'}},
+
+            # слоты SELL
+            'skd_sell_signal_line_0': {'type': 'scatter', 'plotly': {'mode': 'lines'}},
+            'skd_sell_signal_line_1': {'type': 'scatter', 'plotly': {'mode': 'lines'}},
+            'skd_sell_signal_line_2': {'type': 'scatter', 'plotly': {'mode': 'lines'}},
+            'skd_sell_signal_line_3': {'type': 'scatter', 'plotly': {'mode': 'lines'}},
+        }
+    }
+
+    def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        df = dataframe.copy().reset_index(drop=True)
+
+        # 1) Индикатор СКД
+        df = SkdIndicator().compute(df, vol_min=self.vol_min)
+
+        # маркеры старта уровней (для визуальной проверки)
+        df['skd_buy_marker']  = df['skd_buy_price']
+        df['skd_sell_marker'] = df['skd_sell_price']
+
+        # 2) пустые колонки-слоты (float!)
+        for s in range(self.max_slots):
+            df[f'skd_buy_signal_line_{s}']  = np.nan
+            df[f'skd_sell_signal_line_{s}'] = np.nan
+            df[f'skd_buy_signal_line_{s}']  = df[f'skd_buy_signal_line_{s}'].astype('float64')
+            df[f'skd_sell_signal_line_{s}'] = df[f'skd_sell_signal_line_{s}'].astype('float64')
+
+        # 3) FSM активных отрезков
+        active_buy, active_sell = {}, {}
+        created_buy = created_sell = 0
+
+        buy_cols_idx  = {s: df.columns.get_loc(f'skd_buy_signal_line_{s}')  for s in range(self.max_slots)}
+        sell_cols_idx = {s: df.columns.get_loc(f'skd_sell_signal_line_{s}') for s in range(self.max_slots)}
+
+        last_slot_used_buy  = None
+        last_slot_used_sell = None
+
+        def _pick_slot(active_dict: dict, last_used: int | None) -> int:
+            # Сначала свободный слот != last_used
+            for slot in range(self.max_slots):
+                if slot not in active_dict and slot != last_used:
+                    return slot
+            # Потом любой свободный
+            for slot in range(self.max_slots):
+                if slot not in active_dict:
+                    return slot
+            # Иначе — самый «старый», но стараемся не last_used
+            not_last = [s for s in active_dict.keys() if s != last_used]
+            if not_last:
+                return min(not_last, key=lambda k: active_dict[k]['ttl'])
+            return min(active_dict, key=lambda k: active_dict[k]['ttl'])
+
+        for i in range(len(df)):
+            # Продлить buy
+            for slot, v in list(active_buy.items()):
+                df.iat[i, buy_cols_idx[slot]] = v['price']
+                v['ttl'] -= 1
+                if v['ttl'] <= 0:
+                    del active_buy[slot]
+            # Продлить sell
+            for slot, v in list(active_sell.items()):
+                df.iat[i, sell_cols_idx[slot]] = v['price']
+                v['ttl'] -= 1
+                if v['ttl'] <= 0:
+                    del active_sell[slot]
+
+            # Старт BUY
+            bp = df.at[i, 'skd_buy_price']
+            if pd.notna(bp):
+                slot = _pick_slot(active_buy, last_slot_used_buy)
+                active_buy[slot] = {'price': float(bp), 'ttl': self.signal_line_len}
+                last_slot_used_buy = slot
+                created_buy += 1
+
+            # Старт SELL
+            sp = df.at[i, 'skd_sell_price']
+            if pd.notna(sp):
+                slot = _pick_slot(active_sell, last_slot_used_sell)
+                active_sell[slot] = {'price': float(sp), 'ttl': self.signal_line_len}
+                last_slot_used_sell = slot
+                created_sell += 1
+
+        self.logger.info(f"[SKD] created_buy={created_buy}, created_sell={created_sell}, "
+                         f"len={self.signal_line_len}, slots={self.max_slots}, vol_min={self.vol_min}")
+        return df
+
+    def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        dataframe['enter_long'] = 0
+        return dataframe
+
+    def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        dataframe['exit_long'] = 0
+        return dataframe
