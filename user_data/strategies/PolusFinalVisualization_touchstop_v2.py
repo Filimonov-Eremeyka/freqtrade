@@ -1,4 +1,3 @@
-
 # user_data/strategies/PolusFinalVisualization_touchstop_v2.py
 from freqtrade.strategy import IStrategy
 from pandas import DataFrame
